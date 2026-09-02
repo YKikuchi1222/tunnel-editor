@@ -1,4 +1,4 @@
-# e
+# "e" A File Opener for Code Tunnel
 
 `e` opens a file in the VS Code window connected to this machine through `code tunnel`:
 

@@ -1,4 +1,4 @@
-# "e" A File Opener for Code Tunnel
+# e — A File Opener for Code Tunnel, Usable from an External Terminal
 
 `e` opens a file in the VS Code window connected to this machine through `code tunnel`:
 

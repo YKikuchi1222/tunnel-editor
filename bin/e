@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+
+shopt -s nullglob
+export LC_ALL=C
+E_VERSION=0.1.0
+
+PROC_ROOT=${E_PROC_ROOT:-/proc}
+RUNTIME_DIR=${E_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}
+SEARCH_MAX=${E_SEARCH_MAX:-200}
+TIMEOUT_SECONDS=${E_TIMEOUT:-5}
+VERBOSE=${E_DEBUG:-0}
+
+declare -A LISTEN=() CONN=() LISTEN_BY_PATH=()
+declare -A CAND_TIER CAND_ROOT CAND_START CAND_FLAVOR CAND_IPCS CAND_CONN_PATHS
+declare -A CAND_INODES CAND_PID_INODES
+declare -A SERVER_LISTENS=()
+declare -a CANDIDATES=() RECORD_LINES=() REC_META=() REC_CONN=() REC_FLAVOR=() REC_TIER=() REC_START=() REC_INODE=() REC_PID=() REC_SOCK=() REC_ROOT=()
+declare -a CLI_FLAGS=() PATHS=() ABS_PATHS=()
+
+die() {
+    printf 'e: %s\n' "$*" >&2
+    exit 2
+}
+
+verbose() {
+    if (( VERBOSE )); then
+        printf 'e: %s\n' "$*" >&2
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Usage: e [OPTIONS] PATH...
+
+Open files in the VS Code window connected through code tunnel.
+
+Options:
+EOF
+    printf '%-28s%s\n' \
+        '  -h, --help' 'show this help' \
+        '      --version' 'show the version' \
+        '  -l, --list' 'list discovered VS Code CLI endpoints' \
+        '      --dry-run' 'print the command without executing it' \
+        '      --gc' 'remove stale vscode-ipc socket files' \
+        '  -v, --verbose' 'show discovery and request diagnostics' \
+        '      --all' 'send to every connected window (once per process)' \
+        '      --sock N|PATH' 'choose a ranked endpoint or socket path' \
+        '      --new' 'treat a missing path as a new file to create (skip search)' \
+        '  -n, --new-window' 'open in a new window' \
+        '  -r, --reuse-window' 'reuse the existing window' \
+        '  -g, --goto' 'interpret file:line[:column]' \
+        '  -d, --diff' 'compare exactly two paths' \
+        '  -m, --merge' 'merge exactly four paths' \
+        '  -a, --add' 'add a folder to the workspace' \
+        '  -w, --wait' 'wait for the opened file' \
+        '  --' 'stop option parsing'
+}
+
+read_unix_sockets() {
+    local line kind inode path inode_set=''
+    local -a candidate_inodes=()
+    local unix_file=$PROC_ROOT/net/unix
+    [[ -r $unix_file ]] || return 0
+    for inode in "${!CAND_INODES[@]}"; do
+        candidate_inodes+=("$inode")
+    done
+    ((${#candidate_inodes[@]})) && inode_set=${candidate_inodes[*]}
+    while IFS=$'\t' read -r kind inode path; do
+        [[ -n $inode && -n $path ]] || continue
+        [[ $path == @* ]] && continue
+        if [[ $kind == L ]]; then
+            LISTEN["$inode"]=$path
+            LISTEN_BY_PATH["$path"]=$inode
+        elif [[ $kind == C ]]; then
+            CONN["$inode"]=$path
+        fi
+    done < <(
+        awk -v wanted_inodes="$inode_set" '
+            NR == 1 { next }
+            {
+                p = index($0, " /")
+                if (!p) next
+                path = substr($0, p + 1)
+                if (path ~ /^@/) next
+                if ($4 == "00010000" && $6 == "01" && path ~ /\/vscode-ipc-[^\/]*\.sock$/)
+                    print "L\t" $7 "\t" path
+                else if ($4 == "00010000" && $6 == "01" && ($7 in wanted))
+                    print "L\t" $7 "\t" path
+                else if ($6 == "03" && ($7 in wanted))
+                    print "C\t" $7 "\t" path
+            }
+            BEGIN {
+                count = split(wanted_inodes, values, /[[:space:]]+/)
+                for (i = 1; i <= count; i++) if (values[i] != "") wanted[values[i]] = 1
+            }
+        ' "$unix_file" 2>/dev/null
+    )
+}
+
+scan_candidate_pids() {
+    local pid target inode
+    local -a cmdlines=()
+    mapfile -t cmdlines < <(
+        find "$PROC_ROOT" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' \
+            -uid "$EUID" -printf '%p/cmdline\n' 2>/dev/null
+    )
+    ((${#cmdlines[@]})) || return 0
+    while IFS=$'\t' read -r pid tier; do
+        [[ $pid =~ ^[0-9]+$ ]] || continue
+        [[ $pid == "$$" ]] && continue
+        if [[ -z ${CAND_TIER[$pid]+x} || $tier -lt ${CAND_TIER[$pid]} ]]; then
+            CAND_TIER["$pid"]=$tier
+        fi
+    done < <(
+        awk -v RS='\0' '
+            {
+                if (FILENAME != last) {
+                    if (last != "") emit()
+                    last = FILENAME
+                    ext = 0
+                    server = 0
+                }
+                if ($0 == "--type=extensionHost") ext = 1
+                if ($0 == "out/server-main.js" || $0 ~ /out\/server-main\.js/) server = 1
+            }
+            function emit(   m) {
+                if (match(last, /\/[0-9]+\/cmdline$/)) {
+                    m = substr(last, RSTART + 1, RLENGTH - 9)
+                    if (ext) print m "\t1"
+                    else if (server) print m "\t2"
+                }
+            }
+            END { if (last != "") emit() }
+        ' "${cmdlines[@]}" 2>/dev/null
+    )
+    for pid in "${!CAND_TIER[@]}"; do
+        CANDIDATES+=("$pid")
+        while IFS= read -r target; do
+            [[ $target == socket:\[*\] ]] || continue
+            inode=${target#socket:[}
+            inode=${inode%]}
+            [[ $inode =~ ^[0-9]+$ ]] || continue
+            CAND_INODES["$inode"]=1
+            CAND_PID_INODES["$pid"]+="$inode"$'\n'
+        done < <(find "$PROC_ROOT/$pid/fd" -mindepth 1 -printf '%l\n' 2>/dev/null)
+    done
+}
+
+inspect_pid() {
+    local pid=$1 tier=$2 exe root statline after starttime flavor inode listen connpath
+    exe=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null) || {
+        verbose "pid $pid skipped: cannot read exe"
+        return 0
+    }
+    [[ $exe == */node ]] || {
+        verbose "pid $pid skipped: executable is not node ($exe)"
+        return 0
+    }
+    root=${exe%/node}
+    [[ -x $root/bin/remote-cli/code ]] || {
+        verbose "pid $pid skipped: missing executable $root/bin/remote-cli/code"
+        return 0
+    }
+    [[ -r $PROC_ROOT/$pid/stat ]] || {
+        verbose "pid $pid skipped: cannot read stat"
+        return 0
+    }
+    statline=$(<"$PROC_ROOT/$pid/stat")
+    after=${statline#*) }
+    read -r -a _stat_fields <<< "$after"
+    starttime=${_stat_fields[19]:-0}
+    [[ $starttime =~ ^[0-9]+$ ]] || starttime=0
+    CAND_ROOT["$pid"]=$root
+    CAND_START["$pid"]=$starttime
+    if [[ $root == */.vscode/cli/servers/* ]]; then
+        flavor=0
+    elif [[ $root == */.vscode-server/* ]]; then
+        flavor=1
+    else
+        flavor=2
+    fi
+    CAND_FLAVOR["$pid"]=$flavor
+    while IFS= read -r inode; do
+        [[ -n $inode ]] || continue
+        listen=${LISTEN[$inode]-}
+        if [[ -n $listen ]]; then
+            if [[ $listen == */vscode-ipc-*.sock ]]; then
+                CAND_IPCS["$pid"]+="$listen"$'\n'
+            elif (( tier == 2 )); then
+                SERVER_LISTENS["$listen"]=1
+            fi
+        fi
+        connpath=${CONN[$inode]-}
+        [[ -n $connpath ]] && CAND_CONN_PATHS["$pid"]+="$connpath"$'\n'
+    done <<< "${CAND_PID_INODES[$pid]-}"
+}
+
+discover() {
+    local pid line meta sock root conn flavor tier start inode padded_start padded_inode
+    local -a order=()
+    scan_candidate_pids
+    read_unix_sockets
+    for pid in "${CANDIDATES[@]}"; do
+        [[ ${CAND_TIER[$pid]} == 2 ]] && order+=("$pid")
+    done
+    for pid in "${CANDIDATES[@]}"; do
+        [[ ${CAND_TIER[$pid]} == 1 ]] && order+=("$pid")
+    done
+    for pid in "${order[@]}"; do
+        inspect_pid "$pid" "${CAND_TIER[$pid]}"
+    done
+    for pid in "${order[@]}"; do
+        [[ -n ${CAND_IPCS[$pid]-} ]] || continue
+        conn=0
+        if ((${#SERVER_LISTENS[@]} == 0)); then
+            conn=1
+        else
+            while IFS= read -r line; do
+                [[ -n $line && -n ${SERVER_LISTENS[$line]+x} ]] && { conn=1; break; }
+            done <<< "${CAND_CONN_PATHS[$pid]-}"
+        fi
+        while IFS= read -r sock; do
+            [[ -n $sock ]] || continue
+            inode=${LISTEN_BY_PATH[$sock]-0}
+            flavor=${CAND_FLAVOR[$pid]}
+            tier=${CAND_TIER[$pid]}
+            start=${CAND_START[$pid]}
+            root=${CAND_ROOT[$pid]}
+            printf -v padded_start '%020d' "$start"
+            printf -v padded_inode '%020d' "$inode"
+            meta="$conn $flavor $tier $padded_start $padded_inode $pid"
+            RECORD_LINES+=("$meta"$'\t'"$sock"$'\t'"$root")
+        done <<< "${CAND_IPCS[$pid]}"
+    done
+    if ((${#RECORD_LINES[@]})); then
+        mapfile -t RECORD_LINES < <(printf '%s\n' "${RECORD_LINES[@]}" | sort -k1,1nr -k2,2n -k3,3n -k4,4nr -k5,5nr)
+        for line in "${RECORD_LINES[@]}"; do
+            meta=${line%%$'\t'*}
+            line=${line#*$'\t'}
+            sock=${line%%$'\t'*}
+            root=${line#*$'\t'}
+            read -r conn flavor tier start inode pid <<< "$meta"
+            REC_META+=("$meta")
+            REC_CONN+=("$conn")
+            REC_FLAVOR+=("$flavor")
+            REC_TIER+=("$tier")
+            REC_START+=("$start")
+            REC_INODE+=("$inode")
+            REC_PID+=("$pid")
+            REC_SOCK+=("$sock")
+            REC_ROOT+=("$root")
+        done
+    fi
+}
+
+flavor_name() {
+    case $1 in
+        0) printf 'tunnel' ;;
+        1) printf 'remote-ssh' ;;
+        *) printf 'other' ;;
+    esac
+}
+
+tier_name() {
+    if [[ $1 == 1 ]]; then printf 'exthost'; else printf 'terminal'; fi
+}
+
+print_list() {
+    local i display_conn
+    printf 'RANK\tCONN\tFLAVOR\tTIER\tPID\tSOCKET\tSERVER_ROOT\n'
+    for ((i = 0; i < ${#REC_SOCK[@]}; i++)); do
+        if ((${#SERVER_LISTENS[@]} == 0)); then display_conn='?'
+        elif [[ ${REC_CONN[$i]} == 1 ]]; then display_conn=yes
+        else display_conn=no
+        fi
+        printf '%d\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$((i + 1))" "$display_conn" "$(flavor_name "${REC_FLAVOR[$i]}")" \
+            "$(tier_name "${REC_TIER[$i]}")" "${REC_PID[$i]}" "${REC_SOCK[$i]}" "${REC_ROOT[$i]}"
+    done
+}
+
+search_files() {
+    local pattern=$1 candidate choice count truncated=0 filtered='' grep_status=0
+    local -a candidates matches=() grep_args=()
+    [[ $pattern =~ [A-Z] ]] || grep_args=(-i)
+    if [[ $(git rev-parse --is-inside-work-tree 2>/dev/null) == true ]]; then
+        mapfile -t candidates < <(git ls-files --cached --others --exclude-standard 2>/dev/null)
+    elif command -v rg >/dev/null 2>&1; then
+        mapfile -t candidates < <(rg --files . 2>/dev/null)
+        for ((count = 0; count < ${#candidates[@]}; count++)); do
+            candidates[count]=${candidates[count]#./}
+        done
+    else
+        mapfile -t candidates < <(find . -maxdepth 6 -type f -not -path './.git/*' -print 2>/dev/null)
+        for ((count = 0; count < ${#candidates[@]}; count++)); do
+            candidates[count]=${candidates[count]#./}
+        done
+    fi
+    if ! [[ $SEARCH_MAX =~ ^[0-9]+$ ]] || (( SEARCH_MAX < 1 )); then
+        SEARCH_MAX=200
+    fi
+    if ((${#candidates[@]})); then
+        if filtered=$(printf '%s\n' "${candidates[@]}" | /usr/bin/grep -E "${grep_args[@]}" -- "$pattern" | head -n "$((SEARCH_MAX + 1))"); then
+            grep_status=0
+        else
+            grep_status=$?
+        fi
+        if ((grep_status != 0 && grep_status != 1 && grep_status != 141)); then
+            printf 'e: search failed for /%s/\n' "$pattern" >&2
+            return 1
+        fi
+        [[ -n $filtered ]] && mapfile -t matches <<< "$filtered"
+    fi
+    if ((${#matches[@]} > SEARCH_MAX)); then
+        truncated=1
+        matches=("${matches[@]:0:SEARCH_MAX}")
+    fi
+    if ((truncated)); then
+        printf 'e: search results truncated at %d; refine the pattern\n' "$SEARCH_MAX" >&2
+    fi
+    if ((${#matches[@]} == 0)); then
+        printf 'e: no file matches /%s/ under %s (use --new to create %s)\n' "$pattern" "$PWD" "$pattern" >&2
+        return 1
+    fi
+    if ((${#matches[@]} == 1)); then
+        SEARCH_RESULT=${matches[0]}
+        return 0
+    fi
+    printf 'e: multiple files match /%s/ under %s:\n' "$pattern" "$PWD" >&2
+    count=0
+    for candidate in "${matches[@]}"; do
+        ((count += 1))
+        if ((count <= 30)); then printf '  %d) %s\n' "$count" "$candidate" >&2; fi
+    done
+    if ((${#matches[@]} > 30)); then printf 'e: more matches exist; refine the pattern\n' >&2; fi
+    if [[ -t 2 && -r /dev/tty ]]; then
+        choice=''
+        read -r -p 'e: choose a number: ' choice </dev/tty || choice=''
+        if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#matches[@]})); then
+            SEARCH_RESULT=${matches[choice - 1]}
+            return 0
+        fi
+    fi
+    printf 'e: aborted\n' >&2
+    return 1
+}
+
+gc_sockets() {
+    local path real count=0
+    for path in "$RUNTIME_DIR"/vscode-ipc-*.sock; do
+        [[ -S $path && -O $path ]] || continue
+        real=$(realpath "$path" 2>/dev/null) || real=$path
+        [[ -n ${LISTEN_BY_PATH[$path]+x} || -n ${LISTEN_BY_PATH[$real]+x} ]] && continue
+        if ((DRY_RUN)); then
+            printf 'would remove: %s\n' "$path"
+        else
+            rm -f -- "$path"
+        fi
+        ((count += 1))
+    done
+    if ((DRY_RUN)); then
+        printf 'e: would remove %d stale socket file(s) from %s\n' "$count" "$RUNTIME_DIR"
+    else
+        printf 'e: removed %d stale socket file(s) from %s\n' "$count" "$RUNTIME_DIR"
+    fi
+    exit 0
+}
+
+run_endpoint() {
+    local idx=$1 tmp rc err
+    tmp=$(mktemp) || return 1
+    if [[ $WAIT_MODE == 1 ]]; then
+        VSCODE_IPC_HOOK_CLI=${REC_SOCK[$idx]} "${REC_ROOT[$idx]}/bin/remote-cli/code" \
+            "${CLI_FLAGS[@]}" -- "${ABS_PATHS[@]}" 2>"$tmp"
+        rc=$?
+    else
+        VSCODE_IPC_HOOK_CLI=${REC_SOCK[$idx]} timeout "$TIMEOUT_SECONDS" \
+            "${REC_ROOT[$idx]}/bin/remote-cli/code" "${CLI_FLAGS[@]}" -- "${ABS_PATHS[@]}" 2>"$tmp"
+        rc=$?
+    fi
+    err=$(<"$tmp")
+    rm -f -- "$tmp"
+    [[ -n $err ]] && printf '%s\n' "$err" >&2
+    if ((rc == 0)) && [[ $err != *'Error in request'* && $err != *'Error when requesting'* ]]; then
+        return 0
+    fi
+    verbose "endpoint ${REC_SOCK[$idx]} failed (status $rc)${err:+: $err}"
+    return 1
+}
+
+parse_args() {
+    local arg end_options=0
+    CLI_FLAGS=()
+    PATHS=()
+    ABS_PATHS=()
+    LIST_MODE=0 DRY_RUN=0 GC_MODE=0 ALL_MODE=0 NEW_MODE=0 NEW_WINDOW=0 REUSE_WINDOW=0 ADD_MODE=0 WAIT_MODE=0
+    GOTO_FLAG=0 GOTO_DETECTED=0 DIFF_MODE=0 MERGE_MODE=0 SOCK_SELECTOR=''
+    while (($#)); do
+        arg=$1
+        shift
+        if ((end_options)); then
+            PATHS+=("$arg")
+            continue
+        fi
+        if [[ $arg == -- ]]; then
+            end_options=1
+            continue
+        fi
+        case $arg in
+            -h|--help) usage; exit 0 ;;
+            --version) printf '%s\n' "$E_VERSION"; exit 0 ;;
+            -l|--list) LIST_MODE=1 ;;
+            --dry-run) DRY_RUN=1 ;;
+            --gc) GC_MODE=1 ;;
+            -v|--verbose) VERBOSE=1 ;;
+            --all) ALL_MODE=1 ;;
+            --new) NEW_MODE=1 ;;
+            --sock)
+                (($#)) || die '--sock requires a rank or socket path'
+                SOCK_SELECTOR=$1; shift ;;
+            -n|--new-window) CLI_FLAGS+=("$arg"); NEW_WINDOW=1 ;;
+            -r|--reuse-window) CLI_FLAGS+=("$arg"); REUSE_WINDOW=1 ;;
+            -g|--goto) CLI_FLAGS+=("$arg"); GOTO_FLAG=1 ;;
+            -d|--diff) CLI_FLAGS+=("$arg"); DIFF_MODE=1 ;;
+            -m|--merge) CLI_FLAGS+=("$arg"); MERGE_MODE=1 ;;
+            -a|--add) CLI_FLAGS+=("$arg"); ADD_MODE=1 ;;
+            -w|--wait) CLI_FLAGS+=("$arg"); WAIT_MODE=1 ;;
+            -) die 'reading stdin is not supported' ;;
+            -*) die "unknown option $arg (put -- before file names that start with -)" ;;
+            *) PATHS+=("$arg") ;;
+        esac
+    done
+    ((GC_MODE)) && { ((${#PATHS[@]} == 0)) || die '--gc cannot be combined with paths'; }
+    ((LIST_MODE)) && { ((${#PATHS[@]} == 0)) || die '--list cannot be combined with paths'; }
+}
+
+main() {
+    local i prefix line col base suffix path selected_sock idx attempts=0 success=0 connected=0
+    local -a bases=() suffixes=() abs_bases=()
+    parse_args "$@"
+    ((GC_MODE)) && { discover; gc_sockets; }
+    if ((!LIST_MODE && ${#PATHS[@]} == 0)); then die 'no path specified'; fi
+    if ((DIFF_MODE && ${#PATHS[@]} != 2)); then die '-d/--diff requires exactly 2 paths'; fi
+    if ((MERGE_MODE && ${#PATHS[@]} != 4)); then die '-m/--merge requires exactly 4 paths'; fi
+    discover
+    selected_sock=${E_VSCODE_IPC_SOCK:-}
+    [[ -n $SOCK_SELECTOR ]] && selected_sock=$SOCK_SELECTOR
+    if [[ -n $selected_sock && $selected_sock =~ ^[0-9]+$ ]]; then
+        idx=$((selected_sock - 1))
+        ((idx >= 0 && idx < ${#REC_SOCK[@]})) || die "--sock rank $selected_sock is out of range"
+    elif [[ -n $selected_sock && -z ${LISTEN_BY_PATH[$selected_sock]+x} ]]; then
+        die "socket is not listening: $selected_sock"
+    fi
+    if ((LIST_MODE)); then
+        if ((${#REC_SOCK[@]} == 0)); then
+            printf 'e: no live VS Code window found (no listening vscode-ipc socket owned by a VS Code server). Is code tunnel running with a window attached? Try: e --list\n' >&2
+            exit 1
+        fi
+        print_list
+        exit 0
+    fi
+    for path in "${PATHS[@]}"; do
+        suffix=''
+        if [[ $path == '-' ]]; then die 'reading stdin is not supported'; fi
+        if [[ -e $path ]]; then
+            base=$path
+        elif [[ $path =~ ^(.+):([0-9]+):([0-9]+)$ ]]; then
+            prefix=${BASH_REMATCH[1]}
+            line=${BASH_REMATCH[2]}
+            col=${BASH_REMATCH[3]}
+            suffix=":$line"
+            suffix+=":$col"
+            if [[ -e $prefix ]]; then
+                base=$prefix
+            else
+                search_files "$prefix" || exit 1
+                base=$SEARCH_RESULT
+            fi
+            GOTO_DETECTED=1
+        elif [[ $path =~ ^(.+):([0-9]+)$ ]]; then
+            prefix=${BASH_REMATCH[1]}
+            line=${BASH_REMATCH[2]}
+            suffix=":$line"
+            if [[ -e $prefix ]]; then
+                base=$prefix
+            else
+                search_files "$prefix" || exit 1
+                base=$SEARCH_RESULT
+            fi
+            GOTO_DETECTED=1
+        elif ((NEW_MODE)); then
+            base=$path
+        else
+            search_files "$path" || exit 1
+            base=$SEARCH_RESULT
+        fi
+        bases+=("$base")
+        suffixes+=("$suffix")
+    done
+    mapfile -d '' -t abs_bases < <(realpath -zsm -- "${bases[@]}" 2>/dev/null)
+    ((${#abs_bases[@]} == ${#bases[@]})) || die 'could not resolve one or more paths'
+    for ((i = 0; i < ${#abs_bases[@]}; i++)); do
+        [[ -d ${abs_bases[$i]} && $ADD_MODE -eq 0 && $NEW_WINDOW -eq 0 ]] && \
+            die "${abs_bases[$i]} is a directory; use -a (add to workspace) or -n (new window)"
+        ABS_PATHS+=("${abs_bases[$i]}${suffixes[$i]}")
+    done
+    if ((DIFF_MODE && ${#ABS_PATHS[@]} != 2)); then die '-d/--diff requires exactly 2 paths'; fi
+    if ((MERGE_MODE && ${#ABS_PATHS[@]} != 4)); then die '-m/--merge requires exactly 4 paths'; fi
+    if (( !NEW_WINDOW && !REUSE_WINDOW )); then CLI_FLAGS=(-r "${CLI_FLAGS[@]}"); fi
+    if ((GOTO_DETECTED && !GOTO_FLAG)); then CLI_FLAGS+=( -g ); fi
+    if ((${#REC_SOCK[@]} == 0)); then
+        printf 'e: no live VS Code window found (no listening vscode-ipc socket owned by a VS Code server). Is code tunnel running with a window attached? Try: e --list\n' >&2
+        exit 1
+    fi
+    if [[ -n $selected_sock ]]; then
+        if [[ $selected_sock =~ ^[0-9]+$ ]]; then
+            idx=$((selected_sock - 1))
+            ((idx >= 0 && idx < ${#REC_SOCK[@]})) || die "--sock rank $selected_sock is out of range"
+        else
+            [[ -n ${LISTEN_BY_PATH[$selected_sock]+x} ]] || die "socket is not listening: $selected_sock"
+            idx=-1
+            for ((i = 0; i < ${#REC_SOCK[@]}; i++)); do
+                [[ ${REC_SOCK[$i]} == "$selected_sock" ]] && { idx=$i; break; }
+            done
+            ((idx >= 0)) || die "listening socket is not owned by a VS Code server process: $selected_sock"
+        fi
+    else
+        idx=0
+    fi
+    if ((DRY_RUN)); then
+        printf 'VSCODE_IPC_HOOK_CLI=%q ' "${REC_SOCK[$idx]}"
+        printf '%q ' "${REC_ROOT[$idx]}/bin/remote-cli/code"
+        printf '%q ' "${CLI_FLAGS[@]}"
+        printf '%q ' -- "${ABS_PATHS[@]}"
+        printf '\n'
+        exit 0
+    fi
+    if ((ALL_MODE)); then
+        declare -A sent_pids=()
+        for ((i = 0; i < ${#REC_SOCK[@]}; i++)); do
+            [[ ${REC_CONN[$i]} == 1 ]] && { connected=1; break; }
+        done
+        if ((connected == 0)); then
+            printf 'e: --all found no connected window (all %d candidate(s) look disconnected); use --sock to force one\n' \
+                "${#REC_SOCK[@]}" >&2
+            exit 1
+        fi
+        for ((i = 0; i < ${#REC_SOCK[@]}; i++)); do
+            [[ ${REC_CONN[$i]} == 1 ]] || continue
+            [[ -n ${sent_pids[${REC_PID[$i]}]+x} ]] && continue
+            sent_pids[${REC_PID[$i]}]=1
+            ((attempts += 1))
+            if run_endpoint "$i"; then success=1; fi
+        done
+    elif [[ -n $selected_sock || -n $SOCK_SELECTOR ]]; then
+        attempts=1
+        if run_endpoint "$idx"; then success=1; fi
+    else
+        for ((i = idx; i < ${#REC_SOCK[@]} && attempts < 3; i++)); do
+            ((attempts += 1))
+            if run_endpoint "$i"; then
+                success=1
+                idx=$i
+                break
+            fi
+        done
+        if ((success == 0 && idx != 0)); then
+            for ((i = 0; i < idx && attempts < 3; i++)); do
+                ((attempts += 1))
+                if run_endpoint "$i"; then success=1; idx=$i; break; fi
+            done
+        fi
+    fi
+    if ((success)); then
+        if [[ ${REC_CONN[$idx]} == 0 ]]; then
+            printf 'e: warning: the VS Code window behind this server looks disconnected (pid %s, reconnection grace period); the file opens when that window reconnects\n' "${REC_PID[$idx]}" >&2
+        fi
+        exit 0
+    fi
+    printf 'e: VS Code rejected the request on %d endpoint(s); rerun with -v for details\n' "$attempts" >&2
+    exit 1
+}
+
+main "$@"
